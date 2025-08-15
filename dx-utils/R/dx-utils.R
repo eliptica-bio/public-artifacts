@@ -1,8 +1,30 @@
+tar_compress = function(source, destination, verbose=FALSE) {
+  tar_args = c("-czvf", destination, "-C", dirname(source), basename(source))
+  if(verbose) {
+    message(paste(c("tar", tar_args), collapse=" "))
+  }
+
+  system2("tar", tar_args, stdout=T)
+}
+
+tar_extract = function(source, destination, verbose=FALSE) {
+  if (!dir.exists(destination)) {
+    dir.create(destination, recursive = TRUE)
+  }
+
+  tar_args = c("-xzvf", source, "-C", destination)
+  if (verbose) {
+    message(paste(c("tar", tar_args), collapse=" "))
+  }
+
+  system2("tar", tar_args, stdout = TRUE)
+}
+
 dx_system = function(args, verbose=F) {
   if(verbose) {
     message(glue::glue("Command: {paste0(c('dx', args), collapse=' ')}"))
   }
-  out = invisible(system2("dx", args, stdout=T))
+  out = suppressWarnings(invisible(system2("dx", args, stdout=T)))
   return(out)
 }
 
@@ -25,13 +47,6 @@ dx_mkdir = function(path, verbose=F) {
   mkdir_out = dx_system(c("mkdir", "-p", path), verbose=verbose)
   if(!dx_ok(mkdir_out, verbose=verbose)) {
     stop(glue::glue("dx mkdir failed"))
-  }
-}
-
-dx_rm_ids = function(ids, verbose=F) {
-  rm_out = dx_system(c("rm", ids), verbose=verbose)
-  if(!dx_ok(rm_out, verbose=verbose)) {
-    stop(glue::glue("dx rm failed"))
   }
 }
 
@@ -63,14 +78,14 @@ dx_exist = function(remote_path, is_folder=T, is_file=T, verbose=F) {
   basename(remote_path) %in% basename(ls_contents)
 }
 
-dx_file_ids = function(remote_file_path, verbose=F) {
+dx_file_ids = function(remote_path, verbose=F) {
   dx_ensure()
 
-  if (missing(remote_file_path)) stop("Usage: dx_file_id(remote_file_path)")
-  folder = dirname(remote_file_path);
+  if (missing(remote_path)) stop("Usage: dx_file_ids(remote_file_path)")
+  folder = dirname(remote_path);
 
   if (folder %in% c(".", "/")) folder = "/"
-  name  = basename(remote_file_path)
+  name  = basename(remote_path)
 
   ids_out = invisible(dx_system(c("find", "data", "--path", folder, "--name", name, "--brief"), verbose=verbose))
   if(!dx_ok(ids_out, verbose=verbose)) {
@@ -83,7 +98,23 @@ dx_file_ids = function(remote_file_path, verbose=F) {
   invisible(ids)
 }
 
-dx_upload = function(local_path, remote_path, verbose=F) {
+dx_rm_ids = function(ids, verbose=F) {
+  rm_out = dx_system(c("rm", ids), verbose=verbose)
+  if(!dx_ok(rm_out, verbose=verbose)) {
+    stop(glue::glue("dx rm failed"))
+  }
+}
+
+dx_rm = function(remote_path, verbose=F) {
+  dx_ensure()
+  if (missing(remote_path)) {
+    stop("Usage: dx_rm(remote_path, verbose=FALSE)")
+  }
+
+  dx_system(c("rm", "--all", "--recursive", "--force", remote_path), verbose=verbose)
+}
+
+dx_upload = function(local_path, remote_path, verbose=F, progress=T) {
   dx_ensure()
 
   if (missing(local_path) || missing(remote_path)) {
@@ -93,7 +124,6 @@ dx_upload = function(local_path, remote_path, verbose=F) {
   if (!file.exists(local_path)) {
     stop(glue::glue("Local path does not exist: {local_path}"))
   }
-
 
   local_abs = normalizePath(local_path, mustWork=T)
   l_is_dir = dir.exists(local_abs)
@@ -106,7 +136,8 @@ dx_upload = function(local_path, remote_path, verbose=F) {
   }
 
   # Process each file: delete all existing matches, then upload fresh
-  for (lf in local_files) {
+  dx_completed_mkdir = c()
+  pbapply::pblapply(local_files, function(lf) {
     lname = basename(lf)
     ldir = dirname(lf)
     lpath = glue::glue("{ldir}/{lname}")
@@ -126,12 +157,12 @@ dx_upload = function(local_path, remote_path, verbose=F) {
     }
 
     # Ensure parent folder exists remotely
-    dx_mkdir(rdir, verbose=verbose)
-    ids = dx_file_ids(rpath, verbose=verbose)
-    if (length(ids)) {
-      rm_out = dx_system(c("rm", ids), verbose=verbose)
-      dx_ok(rm_out, verbose=verbose)
+    if(!(rdir %in% dx_completed_mkdir)) {
+      dx_mkdir(rdir, verbose=verbose)
+      dx_completed_mkdir = c(dx_completed_mkdir, rdir)
     }
+
+    dx_rm(rpath, verbose=verbose)
 
     upload_args = c("upload", lpath)
     if(rdir != "") upload_args = c(upload_args, "--destination", glue::glue("{rdir}/"))
@@ -141,7 +172,7 @@ dx_upload = function(local_path, remote_path, verbose=F) {
     }
 
     unlink(tmp_dir, recursive=T)
-  }
+  })
 
   invisible(TRUE)
 }
@@ -192,34 +223,7 @@ dx_download = function(remote_path, local_path, verbose=F) {
   invisible(TRUE)
 }
 
-dx_download_libraries = function(R_env, overwrite=TRUE, quiet=FALSE) {
-  dx_ensure()
-  stopifnot(is.character(R_env), length(R_env) == 1L, nzchar(R_env))
-
-  # Resolve the local path: ~/R_libs/<R_env>
-  local_dir = path.expand(file.path("~", "R_libs", R_env))
-  dir.create(local_dir, recursive=T, showWarnings=F)
-
-  remote_dir = glue::glue("R_libs/{R_env}")
-
-  # Run dx download and check for errors
-  remote_exist = dx_exist(remote_dir)
-  if(remote_exist) {
-    dx_args = c("download", "-r", remote_dir, "-o", dirname(local_dir))
-    if (overwrite) dx_args = c(dx_args, "--overwrite")
-    if (quiet)     dx_args = c(dx_args, "--no-progress")
-    dx_out = tryCatch(system2("dx", dx_args, stdout=T, stderr=T), error=function(e) structure(character(), status=1L))
-
-    if(!dx_ok(dx_out, verbose=verbose)) {
-      stop(glue::glue("dx download failed"))
-    }
-  } else {
-    dir.create(local_dir, showWarnings=F, recursive=T)
-  }
-
-  .libPaths(c(local_dir, .libPaths()))
-
-  required_libraries = c("stringr", "remotes", "readr", "fs")
+dx_ensure_libraries = function(required_libraries=c("stringr", "remotes", "readr", "fs", "pbapply")) {
   for(lib in required_libraries) {
     if(lib %in% rownames(installed.packages()) == FALSE) {
       install.packages(lib, lib=local_dir, quiet=T, repos="http://cran.us.r-project.org")
@@ -227,21 +231,62 @@ dx_download_libraries = function(R_env, overwrite=TRUE, quiet=FALSE) {
   }
 }
 
-dx_upload_libraries = function(R_env, quiet=FALSE) {
-  stopifnot(is.character(R_env), length(R_env) == 1L, nzchar(R_env))
+dx_download_libraries = function(R_env, verbose=FALSE) {
   dx_ensure()
+  if (missing(R_env)) {
+    stop("Usage: dx_download_libraries(R_env, verbose=F)")
+  }
+
+  local_dir = path.expand(file.path("~", "R_libs", R_env))
+  remote_dir = glue::glue("R_libs/{R_env}")
+
+  local_archive = glue::glue("{tmp_dir}/{basename(remote_dir)}.tar.gz")
+  remote_archive = glue::glue("{remote_dir}.tar.gz")
+
+  # Run dx download and check for errors
+  if(dx_exist(remote_archive, is_folder=F, verbose=verbose)) {
+    download_out = dx_download(remote_path=remote_archive, local_path=local_archive, verbose=verbose)
+    if(!dx_ok(download_out, verbose=verbose)) {
+      stop(glue::glue("dx download failed"))
+    }
+
+    unlink(dirname(local_dir), recursive=T, force=T)
+    tar_extract(local_archive, dirname(local_dir), verbose=verbose)
+    unlink(local_archive, recursive=T, force=T)
+  } else {
+    dir.create(local_dir, showWarnings=F, recursive=T)
+  }
+
+  # Set libraries path and install some of the required libraries
+  .libPaths(c(local_dir, .libPaths()))
+  dx_ensure_libraries()
+}
+
+dx_upload_libraries = function(R_env, verbose=FALSE, progress=TRUE) {
+  dx_ensure()
+  if (missing(R_env)) {
+    stop("Usage: dx_upload_libraries(R_env, verbose=F)")
+  }
 
   local_dir  = path.expand(file.path("~", "R_libs", R_env))
   remote_dir = glue::glue("R_libs/{R_env}")
 
   # Upload local libraries folder to project
-  if (dir.exists(local_dir)) {
-    up_args = c("upload", "-r", local_dir, "--destination", remote_dir, "-p")
-    if (quiet) up_args = c(up_args, "--no-progress")
-    up_out = tryCatch(system2("dx", up_args, stdout=T, stderr=T), error = function(e) structure(character(), status=1L))
-    if(!dx_ok(up_out, verbose=verbose)) {
+  if(dir.exists(local_dir)) {
+    tmp_dir = tempfile(pattern = "mytemp_")
+    dir.create(tmp_dir)
+
+    local_archive = glue::glue("{tmp_dir}/{basename(remote_dir)}.tar.gz")
+    remote_archive = glue::glue("{remote_dir}.tar.gz")
+
+    tar_compress(local_dir, local_archive, verbose=verbose)
+
+    dx_rm(remote_archive)
+    upload_out = dx_upload(local_archive, remote_archive, verbose=verbose, progress=progress)
+    if(!dx_ok(upload_out, verbose=verbose)) {
       stop(glue::glue("dx upload failed"))
     }
+    unlink(local_archive, recursive=T, force=T)
   } else {
     message(glue::glue("Local directory '{local_dir}' does not exist; created remote folder '{dest_path(remote_dir)}' only."))
   }
